@@ -1,0 +1,15 @@
+# Minimal OTel Collector: receive OTLP/HTTP from the plugin, expose Prometheus
+# metrics on :8889 for Grafana. Run: otelcol --config examples/otel-collector.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]
