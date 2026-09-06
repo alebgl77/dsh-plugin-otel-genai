@@ -1,0 +1,8 @@
+# Overlay for `dsh --patch examples/cordis.patch.yml`.
+# Exports GenAI token usage and step latency to a local OTel Collector.
+- name: dsh-plugin-otel-genai
+  config:
+    exporter:
+      url: http://localhost:4318/v1/metrics
+    exportIntervalMillis: 15000
+    serviceName: deepseek-harness
