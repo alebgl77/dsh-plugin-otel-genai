@@ -91,7 +91,9 @@ export interface SessionLike {
 
 export type SessionEventLike =
   | { type: 'request/context'; seq: number; time: number; data: { provider: string; model: string } }
+  | { type: 'request/header'; seq: number; time: number; data: { header: { config: { provider: string; model: string } } } }
   | { type: 'step/start'; seq: number; time: number; data: { turn: number; step: number } }
+  | { type: 'step/end'; seq: number; time: number; data: { turn: number; step: number } }
   | { type: 'assistant/message'; seq: number; time: number; data: { turn: number; step: number; usage?: TokenUsageLike } }
   | { type: string; seq: number; time: number; data: unknown }
 
@@ -137,10 +139,25 @@ interface Instruments {
 
 const DEFAULT_EXPORT_INTERVAL_MILLIS = 15_000
 const DEFAULT_SERVICE_NAME = 'deepseek-harness'
+const TOKEN_BUCKET_BOUNDARIES = [
+  1, 4, 16, 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304, 16_777_216, 67_108_864,
+]
+const DURATION_BUCKET_BOUNDARIES = [
+  0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
+]
 
 function validateConfig(config: Config): void {
   const url = config.exporter?.url
-  if (typeof url !== 'string' || !/^https?:\/\//u.test(url)) {
+  let validUrl = false
+  if (typeof url === 'string') {
+    try {
+      const parsedUrl = new URL(url)
+      validUrl = (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:') && parsedUrl.hostname !== ''
+    } catch {
+      // Keep URL parser errors from exposing endpoint credentials.
+    }
+  }
+  if (!validUrl) {
     throw new Error('otel-genai: exporter.url must be an http(s) URL')
   }
   if (config.exportIntervalMillis !== undefined
@@ -166,21 +183,25 @@ function createInstruments(provider: MeterProvider): Instruments {
       description: 'Number of input and output tokens used per model call',
       unit: '{token}',
       valueType: ValueType.INT,
+      advice: { explicitBucketBoundaries: TOKEN_BUCKET_BOUNDARIES },
     }),
     operationDuration: meter.createHistogram(METRIC_GEN_AI_CLIENT_OPERATION_DURATION, {
       description: 'Duration of one model step, from step start to the settled assistant message',
       unit: 's',
       valueType: ValueType.DOUBLE,
+      advice: { explicitBucketBoundaries: DURATION_BUCKET_BOUNDARIES },
     }),
     cacheRead: meter.createHistogram(METRIC_DSH_GENAI_CLIENT_TOKEN_CACHE_READ, {
       description: 'Input tokens served from the provider prompt cache per model call',
       unit: '{token}',
       valueType: ValueType.INT,
+      advice: { explicitBucketBoundaries: TOKEN_BUCKET_BOUNDARIES },
     }),
     reasoning: meter.createHistogram(METRIC_DSH_GENAI_CLIENT_TOKEN_REASONING, {
       description: 'Reasoning output tokens per model call, when the adapter reports them',
       unit: '{token}',
       valueType: ValueType.INT,
+      advice: { explicitBucketBoundaries: TOKEN_BUCKET_BOUNDARIES },
     }),
   }
 }
@@ -191,7 +212,7 @@ function createInstruments(provider: MeterProvider): Instruments {
  */
 export class GenAiMetricsRecorder {
   private readonly routes = new Map<string, Route>()
-  private readonly stepStarts = new Map<string, number>()
+  private readonly stepStarts = new Map<string, Map<string, number>>()
 
   constructor(
     private readonly instruments: Instruments,
@@ -202,6 +223,14 @@ export class GenAiMetricsRecorder {
     if (session.firstLiveSeq !== undefined && event.seq < session.firstLiveSeq) return
 
     switch (event.type) {
+      case 'request/header': {
+        const data = event.data as { header?: { config?: Partial<Route> } } | null | undefined
+        const config = data?.header?.config
+        if (typeof config?.provider === 'string' && typeof config.model === 'string') {
+          this.routes.set(session.id, { provider: config.provider, model: config.model })
+        }
+        return
+      }
       case 'request/context': {
         const data = event.data as { provider: string; model: string }
         this.routes.set(session.id, { provider: data.provider, model: data.model })
@@ -209,14 +238,22 @@ export class GenAiMetricsRecorder {
       }
       case 'step/start': {
         const data = event.data as { turn: number; step: number }
-        this.stepStarts.set(stepKey(session.id, data.turn, data.step), event.time)
+        let starts = this.stepStarts.get(session.id)
+        if (starts === undefined) {
+          starts = new Map<string, number>()
+          this.stepStarts.set(session.id, starts)
+        }
+        starts.set(stepKey(data.turn, data.step), event.time)
+        return
+      }
+      case 'step/end': {
+        const data = event.data as { turn: number; step: number }
+        this.takeStepStart(session.id, data.turn, data.step)
         return
       }
       case 'assistant/message': {
         const data = event.data as { turn: number; step: number; usage?: TokenUsageLike }
-        const key = stepKey(session.id, data.turn, data.step)
-        const startedAt = this.stepStarts.get(key)
-        this.stepStarts.delete(key)
+        const startedAt = this.takeStepStart(session.id, data.turn, data.step)
         const attributes = this.attributesFor(session)
 
         if (startedAt !== undefined && event.time >= startedAt) {
@@ -249,9 +286,16 @@ export class GenAiMetricsRecorder {
 
   forget(sessionId: string): void {
     this.routes.delete(sessionId)
-    for (const key of this.stepStarts.keys()) {
-      if (key.startsWith(`${sessionId}\u0000`)) this.stepStarts.delete(key)
-    }
+    this.stepStarts.delete(sessionId)
+  }
+
+  private takeStepStart(sessionId: string, turn: number, step: number): number | undefined {
+    const starts = this.stepStarts.get(sessionId)
+    const key = stepKey(turn, step)
+    const startedAt = starts?.get(key)
+    starts?.delete(key)
+    if (starts?.size === 0) this.stepStarts.delete(sessionId)
+    return startedAt
   }
 
   private attributesFor(session: SessionLike): Attributes {
@@ -269,8 +313,8 @@ export class GenAiMetricsRecorder {
   }
 }
 
-function stepKey(sessionId: string, turn: number, step: number): string {
-  return `${sessionId}\u0000${turn}\u0000${step}`
+function stepKey(turn: number, step: number): string {
+  return `${turn}\u0000${step}`
 }
 
 /**

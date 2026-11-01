@@ -37,6 +37,21 @@ Duration is measured from the `step/start` event to the settled
 `assistant/message` of the same step, in the harness process clock. It covers
 the whole model call including streaming, not the provider-side latency.
 
+Histograms use the explicit bucket boundaries recommended by
+[OTel GenAI v1.39.0](https://github.com/open-telemetry/semantic-conventions/blob/v1.39.0/docs/gen-ai/gen-ai-metrics.md):
+token buckets range from 1 to 67,108,864 in factors of four (also used for
+cache read and reasoning), and duration buckets from 0.01 to 81.92 seconds in
+factors of two. This separates typical model calls for more useful p95
+estimates. Sums and counts are unchanged; when upgrading, account for the
+different bucket layout in queries spanning historical and new data.
+
+Provider and model metadata also come from `request/header`'s config, so
+resumed sessions retain their route when no new `request/context` is emitted.
+Only the config's provider and model fields are read. Pending step timestamps
+are stored per session, consumed by the settled message or `step/end`, and
+discarded when the session is disposed. `step/end` emits no measurement for
+an abandoned step.
+
 ## Install
 
 ```sh
